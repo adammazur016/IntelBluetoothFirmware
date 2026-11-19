@@ -214,8 +214,21 @@ void IntelBluetoothFirmware::publishReg(bool isSucceed, const char *fwName)
     if (isSucceed)
         setProperty("fw_name", OSString::withCString(fwName));
     // Monterey+
-    if (version_major >= 21)
+    if (version_major >= 21) {
         m_pDevice->setName("Bluetooth USB Host Controller");
+        /* PEM: bluetoothd (bm3_usb GetProductAndVendorID) only accepts a USB
+         * device as the internal controller when its "USB Product Name"
+         * property is exactly "Bluetooth USB Host Controller". Intel cards
+         * report no product string, so set it explicitly.
+         */
+        if (isSucceed) {
+            m_pDevice->setProperty("USB Product Name", "Bluetooth USB Host Controller");
+            m_pDevice->setProperty("kUSBProductString", "Bluetooth USB Host Controller");
+            if (!m_pDevice->getProperty("USB Vendor Name")) {
+                m_pDevice->setProperty("USB Vendor Name", "Intel Corp.");
+            }
+        }
+    }
 }
 
 void IntelBluetoothFirmware::cleanUp()
