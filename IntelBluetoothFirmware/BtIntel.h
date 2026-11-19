@@ -195,6 +195,11 @@ protected:
     
     bool intelBulkHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_t *size, int timeout);
     
+    /* PEM: wait for Intel vendor event 0xFF with the given sub code,
+     * skipping unrelated events instead of failing on the first one.
+     */
+    bool waitVendorEvent(uint8_t subCode, uint32_t timeoutMs);
+    
 protected:
     USBDeviceController *m_pUSBDeviceController;
 };

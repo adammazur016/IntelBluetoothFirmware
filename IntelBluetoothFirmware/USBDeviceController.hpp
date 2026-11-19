@@ -22,6 +22,7 @@
 typedef struct {
     int status;
     uint32_t dataLen;
+    volatile bool done;     // PEM: set under _hciLock by the completion
 } InterruptResp;
 
 class USBDeviceController : public OSObject {

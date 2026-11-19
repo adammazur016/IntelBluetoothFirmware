@@ -224,20 +224,30 @@ interruptHandler(void *owner, void *parameter, IOReturn status, uint32_t bytesTr
             break;
     }
     
+    /* PEM: the original code woke the waiter without any condition flag
+     * and without holding the lock. If the transfer completed before the
+     * reader reached IOLockSleepDeadline (device answers fast, CPU busy
+     * during boot), the wakeup was lost, the reader timed out and the whole
+     * firmware load was abandoned. Publish the result under the lock and
+     * let the reader check the flag before sleeping.
+     */
     InterruptResp *resp = (InterruptResp *)parameter;
+    IOLockLock(controller->_hciLock);
     resp->status = status;
     resp->dataLen = bytesTransferred;
-    IOLockWakeup(controller->_hciLock, controller, true);
+    resp->done = true;
+    IOLockWakeup(controller->_hciLock, resp, false);
+    IOLockUnlock(controller->_hciLock);
 }
 
 IOReturn USBDeviceController::
 interruptPipeRead(void *buf, uint32_t buf_size, uint32_t *size, uint32_t timeout)
 {
-    AbsoluteTime deadline;
+    uint64_t deadline;
     IOUSBHostCompletion comple;
     InterruptResp interrupResp;
     
-    clock_interval_to_deadline(timeout, kMillisecondScale, reinterpret_cast<uint64_t*> (&deadline));
+    clock_interval_to_deadline(timeout, kMillisecondScale, &deadline);
     memset(&interrupResp, 0, sizeof(interrupResp));
     comple.action = interruptHandler;
     comple.owner = this;
@@ -246,36 +256,53 @@ interruptPipeRead(void *buf, uint32_t buf_size, uint32_t *size, uint32_t timeout
     IOReturn ret = m_pInterruptReadPipe->io(mReadBuffer, (uint32_t)mReadBuffer->getLength(), &comple, 0);
     if (ret == kIOUSBPipeStalled) {
         m_pInterruptReadPipe->clearStall(true);
+        memset(&interrupResp, 0, sizeof(interrupResp));
         ret = m_pInterruptReadPipe->io(mReadBuffer, (uint32_t)mReadBuffer->getLength(), &comple, 0);
     }
     
-    if (ret == kIOReturnSuccess) {
-        IOLockLock(_hciLock);
-        if (IOLockSleepDeadline(_hciLock, this, deadline, THREAD_INTERRUPTIBLE) != THREAD_AWAKENED) {
-            IOLockUnlock(_hciLock);
-            m_pInterruptReadPipe->abort();
-            XYLog("%s Timeout\n", __FUNCTION__);
-            return kIOReturnTimeout;
-        }
-        if (interrupResp.dataLen <= 0) {
-            IOLockUnlock(_hciLock);
-            XYLog("%s invalid response size: %d\n", __FUNCTION__, interrupResp.dataLen);
-            return kIOReturnError;
-        }
-        if (buf && interrupResp.dataLen > buf_size) {
-            XYLog("%s buf size too small. buflen: %d act: %d\n", __FUNCTION__, buf_size, interrupResp.dataLen);
-        }
-        if (buf) {
-            memcpy(buf, mReadBuffer->getBytesNoCopy(), min(interrupResp.dataLen, buf_size));
-        }
-        if (size) {
-            *size = min(interrupResp.dataLen, buf_size);
-        }
-        IOLockUnlock(_hciLock);
-    } else {
+    if (ret != kIOReturnSuccess) {
         XYLog("%s failed: %s %d\n", __FUNCTION__, stringFromReturn(ret), ret);
+        return ret;
     }
-    return ret;
+    
+    IOLockLock(_hciLock);
+    while (!interrupResp.done) {
+        wait_result_t wr = IOLockSleepDeadline(_hciLock, &interrupResp, deadline, THREAD_UNINT);
+        if (wr == THREAD_TIMED_OUT) {
+            break;
+        }
+    }
+    bool done = interrupResp.done;
+    IOLockUnlock(_hciLock);
+    
+    if (!done) {
+        /* PEM: abort synchronously. The completion references
+         * interrupResp, which lives on this stack frame; an asynchronous
+         * abort let the completion write into a dead stack frame.
+         */
+        m_pInterruptReadPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, NULL);
+        XYLog("%s Timeout (%u ms)\n", __FUNCTION__, timeout);
+        return kIOReturnTimeout;
+    }
+    
+    if (interrupResp.status != kIOReturnSuccess) {
+        XYLog("%s completion error: %s %d\n", __FUNCTION__, stringFromReturn(interrupResp.status), interrupResp.status);
+        return interrupResp.status;
+    }
+    if (interrupResp.dataLen <= 0) {
+        XYLog("%s invalid response size: %d\n", __FUNCTION__, interrupResp.dataLen);
+        return kIOReturnError;
+    }
+    if (buf && interrupResp.dataLen > buf_size) {
+        XYLog("%s buf size too small. buflen: %d act: %d\n", __FUNCTION__, buf_size, interrupResp.dataLen);
+    }
+    if (buf) {
+        memcpy(buf, mReadBuffer->getBytesNoCopy(), min(interrupResp.dataLen, buf_size));
+    }
+    if (size) {
+        *size = min(interrupResp.dataLen, buf_size);
+    }
+    return kIOReturnSuccess;
 }
 
 IOReturn USBDeviceController::

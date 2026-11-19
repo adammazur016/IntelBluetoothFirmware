@@ -101,9 +101,6 @@ downloadFirmware(IntelVersion *ver, IntelBootParams *params, uint32_t *bootParam
     OSData *fwData;
     char fwname[64];
     IOReturn ior;
-    uint32_t actSize = 0;
-    uint8_t buf[CMD_BUF_MAX_SIZE];
-    HciResponse *resp = (HciResponse *)buf;
     bool firmwareMode = false;
     bool ret = true;
     
@@ -218,8 +215,13 @@ download:
         
         /* When FW download fails, send Intel Reset to retry
          * FW download.
+         *
+         * PEM: report the failure (the original returned success here
+         * and went on to boot a half-loaded image).
          */
+        XYLog("Firmware download failed (%d), reset to bootloader\n", ior);
         resetToBootloader();
+        ret = false;
         goto done;
     }
     
@@ -234,21 +236,16 @@ download:
      * and thus just timeout if that happens and fail the setup
      * of this device.
      */
-    memset(buf, 0, sizeof(buf));
-    ior = m_pUSBDeviceController->interruptPipeRead(resp, sizeof(buf), &actSize, 5000);
-    if (ior != kIOReturnSuccess) {
+    /* PEM: wait for the 0xFF/0x06 notification itself; the original
+     * code failed if any other event happened to be read first.
+     */
+    if (!waitVendorEvent(0x06, 5000)) {
         XYLog("waiting for firmware download done timeout\n");
         resetToBootloader();
         ret = false;
         goto done;
     }
-    
-    if (resp->evt.evt == 0xff && resp->numCommands == 0x06) {
-        XYLog("Notify: Firmware download done\n");
-        goto done;
-    }
-    
-    ret = false;
+    XYLog("Notify: Firmware download done\n");
     
 done:
     OSSafeReleaseNULL(fwData);

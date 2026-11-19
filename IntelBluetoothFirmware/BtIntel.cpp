@@ -49,20 +49,99 @@ free()
     super::free();
 }
 
+static uint64_t ibtNowMs()
+{
+    uint64_t abs, ns;
+    clock_get_uptime(&abs);
+    absolutetime_to_nanoseconds(abs, &ns);
+    return ns / 1000000ULL;
+}
+
 bool BtIntel::
 intelSendHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_t *size, int timeout)
 {
-//    XYLog("%s cmd: 0x%02x len: %d\n", __PRETTY_FUNCTION__, cmd->opcode, cmd->len);
     IOReturn ret;
+    uint8_t local[CMD_BUF_MAX_SIZE];
+    bool useLocal = (event == NULL || eventBufSize < sizeof(HciResponse));
+    uint8_t *dst = useLocal ? local : (uint8_t *)event;
+    uint32_t dstSize = useLocal ? (uint32_t)sizeof(local) : eventBufSize;
+    
     if ((ret = m_pUSBDeviceController->sendHCIRequest(cmd, timeout)) != kIOReturnSuccess) {
-        XYLog("%s sendHCIRequest failed: %s %d\n", __FUNCTION__, m_pUSBDeviceController->stringFromReturn(ret), ret);
+        XYLog("%s sendHCIRequest(0x%04x) failed: %s %d\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), m_pUSBDeviceController->stringFromReturn(ret), ret);
         return false;
     }
-    if ((ret = m_pUSBDeviceController->interruptPipeRead(event, eventBufSize, size, timeout)) != kIOReturnSuccess) {
-        XYLog("%s interruptPipeRead failed: %s %d\n", __FUNCTION__, m_pUSBDeviceController->stringFromReturn(ret), ret);
-        return false;
+    
+    /* PEM: the original code took the first interrupt packet as the answer.
+     * A stale or unrelated event (vendor 0xFF notification, a late Command
+     * Complete for another opcode) was then parsed as the response, which
+     * broke version parsing and the whole setup at random. Wait for the
+     * Command Complete / Command Status that belongs to this opcode.
+     */
+    uint64_t end = ibtNowMs() + (uint64_t)timeout;
+    for (;;) {
+        uint64_t now = ibtNowMs();
+        if (now >= end) {
+            XYLog("%s(0x%04x) no matching event within %d ms\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), timeout);
+            return false;
+        }
+        uint32_t got = 0;
+        memset(dst, 0, dstSize);
+        ret = m_pUSBDeviceController->interruptPipeRead(dst, dstSize, &got, (uint32_t)(end - now));
+        if (ret != kIOReturnSuccess) {
+            XYLog("%s(0x%04x) interruptPipeRead failed: %s %d\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), m_pUSBDeviceController->stringFromReturn(ret), ret);
+            return false;
+        }
+        HciEventHdr *hdr = (HciEventHdr *)dst;
+        if (got >= 3 && hdr->evt == 0xff) {
+            XYLog("%s(0x%04x) skipping vendor event 0xff/0x%02x len %u\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), dst[2], got);
+            continue;
+        }
+        if (got >= 5 && hdr->evt == HCI_EV_CMD_COMPLETE) {
+            uint16_t op = (uint16_t)(dst[3] | (dst[4] << 8));
+            if (op != OSSwapLittleToHostInt16(cmd->opcode)) {
+                XYLog("%s(0x%04x) skipping Command Complete for 0x%04x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), op);
+                continue;
+            }
+        } else if (got >= 6 && hdr->evt == HCI_EV_CMD_STATUS) {
+            uint16_t op = (uint16_t)(dst[4] | (dst[5] << 8));
+            if (op != OSSwapLittleToHostInt16(cmd->opcode)) {
+                XYLog("%s(0x%04x) skipping Command Status for 0x%04x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), op);
+                continue;
+            }
+        }
+        if (useLocal && event && eventBufSize) {
+            memcpy(event, dst, min(got, eventBufSize));
+        }
+        if (size) {
+            *size = (useLocal && event) ? min(got, eventBufSize) : got;
+        }
+        return true;
     }
-    return true;
+}
+
+bool BtIntel::
+waitVendorEvent(uint8_t subCode, uint32_t timeoutMs)
+{
+    uint8_t buf[CMD_BUF_MAX_SIZE];
+    uint64_t end = ibtNowMs() + timeoutMs;
+    for (;;) {
+        uint64_t now = ibtNowMs();
+        if (now >= end) {
+            XYLog("%s(0x%02x) timeout after %u ms\n", __FUNCTION__, subCode, timeoutMs);
+            return false;
+        }
+        uint32_t got = 0;
+        memset(buf, 0, sizeof(buf));
+        IOReturn ret = m_pUSBDeviceController->interruptPipeRead(buf, sizeof(buf), &got, (uint32_t)(end - now));
+        if (ret != kIOReturnSuccess) {
+            XYLog("%s(0x%02x) read failed: %s %d\n", __FUNCTION__, subCode, m_pUSBDeviceController->stringFromReturn(ret), ret);
+            return false;
+        }
+        if (got >= 3 && buf[0] == 0xff && buf[2] == subCode) {
+            return true;
+        }
+        XYLog("%s(0x%02x) skipping event 0x%02x/0x%02x len %u\n", __FUNCTION__, subCode, buf[0], buf[2], got);
+    }
 }
 
 bool BtIntel::
@@ -187,10 +266,6 @@ intelVersionInfo(IntelVersion *ver)
 bool BtIntel::
 intelBoot(uint32_t bootAddr)
 {
-    uint8_t buf[CMD_BUF_MAX_SIZE];
-    uint32_t actLen = 0;
-    HciResponse *resp = (HciResponse *)buf;
-    
     if (!sendIntelReset(bootAddr)) {
         XYLog("Intel Soft Reset failed\n");
         resetToBootloader();
@@ -198,26 +273,19 @@ intelBoot(uint32_t bootAddr)
     }
     
     /* The bootloader will not indicate when the device is ready. This
-     * is done by the operational firmware sending bootup notification.
+     * is done by the operational firmware sending bootup notification
+     * (vendor event 0xFF, sub code 0x02).
      *
-     * Booting into operational firmware should not take longer than
-     * 1 second. However if that happens, then just fail the setup
-     * since something went wrong.
+     * PEM: wait specifically for that notification (unrelated events are
+     * skipped) and allow 2 s instead of a single 1 s read.
      */
-    IOReturn ret = m_pUSBDeviceController->interruptPipeRead(buf, sizeof(buf), &actLen, 1000);
-    if (ret != kIOReturnSuccess || actLen <= 0) {
-        XYLog("Intel boot failed\n");
-        if (ret == kIOReturnTimeout) {
-            XYLog("Reset to bootloader\n");
-            resetToBootloader();
-        }
+    if (!waitVendorEvent(0x02, 2000)) {
+        XYLog("Intel boot failed, reset to bootloader\n");
+        resetToBootloader();
         return false;
     }
-    if (resp->evt.evt == 0xff && resp->numCommands == 0x02) {
-        XYLog("Notify: Device reboot done\n");
-        return true;
-    }
-    return false;
+    XYLog("Notify: Device reboot done\n");
+    return true;
 }
 
 bool BtIntel::

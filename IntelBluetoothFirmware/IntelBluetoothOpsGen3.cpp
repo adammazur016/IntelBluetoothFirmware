@@ -165,10 +165,21 @@ setup()
         return false;
     }
     
+    XYLog("TLV: cnvi_top=0x%08x cnvr_top=0x%08x cnvi_bt=0x%08x img_type=0x%02x sbe=%u\n",
+          verTLV.cnvi_top, verTLV.cnvr_top, verTLV.cnvi_bt, verTLV.img_type, verTLV.sbe_type);
+    
     if (INTEL_HW_PLATFORM(verTLV.cnvi_bt) != 0x37) {
         XYLog("Unsupported Intel hardware platform (0x%2x)\n",
               INTEL_HW_PLATFORM(verTLV.cnvi_bt));
         // TODO: We found that the Gen 2 bluetooth may return different size with IntelVersion when in OPERATIONAL mode, then the code will go here, considering we will not attach the really unsupported device to this driver, so we fake it as firmware loaded done here.
+        /* PEM: an all-zero CNVi BT field means the answer was not a valid
+         * version response at all - fail so the caller retries instead of
+         * faking success while the controller is still in bootloader.
+         */
+        if (verTLV.cnvi_bt == 0) {
+            XYLog("Version response carried no CNVi BT info (len %d), treating as failure\n", actLen);
+            return false;
+        }
         return true;
     }
     
@@ -239,9 +250,6 @@ downloadFirmware(IntelVersionTLV *ver, uint32_t *bootParams)
     char fwname[64];
     OSData *fwData = NULL;
     IOReturn ior;
-    uint32_t actSize = 0;
-    uint8_t buf[CMD_BUF_MAX_SIZE];
-    HciResponse *resp = (HciResponse *)buf;
     bool firmwareMode = false;
     bool ret = true;
     
@@ -300,8 +308,13 @@ downloadFirmware(IntelVersionTLV *ver, uint32_t *bootParams)
         
         /* When FW download fails, send Intel Reset to retry
          * FW download.
+         *
+         * PEM: report the failure (the original returned success here
+         * and went on to boot a half-loaded image).
          */
+        XYLog("Firmware download failed (%d), reset to bootloader\n", ior);
         resetToBootloader();
+        ret = false;
         goto done;
     }
     
@@ -316,21 +329,16 @@ downloadFirmware(IntelVersionTLV *ver, uint32_t *bootParams)
      * and thus just timeout if that happens and fail the setup
      * of this device.
      */
-    memset(buf, 0, sizeof(buf));
-    ior = m_pUSBDeviceController->interruptPipeRead(resp, sizeof(buf), &actSize, 5000);
-    if (ior != kIOReturnSuccess) {
+    /* PEM: wait for the 0xFF/0x06 notification itself; the original
+     * code failed if any other event happened to be read first.
+     */
+    if (!waitVendorEvent(0x06, 5000)) {
         XYLog("waiting for firmware download done timeout\n");
         resetToBootloader();
         ret = false;
         goto done;
     }
-    
-    if (resp->evt.evt == 0xff && resp->numCommands == 0x06) {
-        XYLog("Notify: Firmware download done\n");
-        goto done;
-    }
-    
-    ret = false;
+    XYLog("Notify: Firmware download done\n");
     
 done:
     OSSafeReleaseNULL(fwData);
