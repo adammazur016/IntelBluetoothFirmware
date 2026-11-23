@@ -9,6 +9,7 @@
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
 
+#include <pexpert/pexpert.h>
 #include "IntelBTPatcher.hpp"
 
 static CIntelBTPatcher ibtPatcher;
@@ -69,10 +70,24 @@ static KernelPatcher::KextInfo IntelBTPatcher_IOUsbHostInfo {
 void *CIntelBTPatcher::_hookPipeInstance = nullptr;
 bool CIntelBTPatcher::_randomAddressInit = false;
 
+// PEM-PRIV: optional masking of LE feature bits reported by LE Read Local Supported Features (0x2003).
+// macOS (THIRD_PARTY_DONGLE path) never loads IRKs into the controller resolving list, but when the
+// controller advertises LL Privacy it still connects through the filter accept list using the peer's
+// identity address -> connections to RPA-only peers (iPhone, Watch) always time out.
+// Boot-arg ibtpriv=<mask> clears these bits in LE features byte 0 (64 = LL Privacy, 128 = Ext Scanner Filter Policies).
+static uint8_t pemPrivacyMask = 0;
+static volatile int leFeatRewrite = 0;
+
 bool CIntelBTPatcher::init()
 {
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
+    {
+        uint32_t m = 0;
+        if (PE_parse_boot_argn("ibtpriv", &m, sizeof(m)))
+            pemPrivacyMask = (uint8_t)(m & 0xFF);
+        SYSLOG(DRV_NAME, "PEM-PRIV: LE feature mask=0x%02x (boot-arg ibtpriv)", pemPrivacyMask);
+    }
     if (getKernelVersion() < KernelVersion::Monterey) {
         lilu.onKextLoadForce(&IntelBTPatcher_IOBluetoothInfo, 1,
         [](void *user, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -199,6 +214,7 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 #define HCI_OP_LE_SET_SCAN_PARAM        0x200B
 #define HCI_OP_LE_SET_SCAN_ENABLE       0x200C
 #define HCI_OP_LE_READ_REMOTE_FEATURES  0x2016
+#define HCI_OP_LE_READ_LOCAL_FEATURES   0x2003
 
 int remoteReadSCount = 0;
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
@@ -254,6 +270,10 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
         // HCI reset, we need to send Random address again
         if (hdr->opcode == HCI_OP_RESET)
             _randomAddressInit = false;
+        if (pemPrivacyMask && hdr->opcode == HCI_OP_LE_READ_LOCAL_FEATURES) {
+            leFeatRewrite++;
+            SYSLOG(DRV_NAME, "PEM-PRIV: LE Read Local Supported Features sent, will mask 0x%02x", pemPrivacyMask);
+        }
 #if DEBUG
         DBGLOG(DRV_NAME, "[%s] bRequest: 0x%x direction: %s type: %s recipient: %s wValue: 0x%02x wIndex: 0x%02x opcode: 0x%04x len: %d length: %d async: %d", provider->getName(), request.bRequest, requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase], requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase], requestTypeNames[(request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase], request.wValue, request.wIndex, hdr->opcode, hdr->len, request.wLength, completion != nullptr);
         if (hdrLen) {
@@ -294,7 +314,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
             if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
                 dataBuffer->readBytes(0, buffer, allocLen);
                 HciEventHdr *hdr = (HciEventHdr *)buffer;
-                if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
+                if (remoteReadSCount > 0 && hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
                     if (leMetaStage == 0) {
                         leMetaStage = 1;            // real features complete -> pass through
                     } else if (leMetaStage == 1) {  // 1st duplicate -> fake PHY Update Complete
@@ -313,6 +333,18 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                         remoteReadSCount--;
                     }
                 }
+                // PEM-PRIV: Command Complete for LE Read Local Supported Features:
+                // [0]=0x0E [1]=len [2]=ncmd [3..4]=opcode 0x2003 [5]=status [6..13]=features
+                else if (pemPrivacyMask && hdr->evt == 0x0E && allocLen >= 14 &&
+                         hdr->data[1] == 0x03 && hdr->data[2] == 0x20) {
+                    if (leFeatRewrite > 0) leFeatRewrite--;
+                    if (hdr->data[3] == 0x00) {
+                        uint8_t oldF = hdr->data[4];
+                        uint8_t newF = oldF & (uint8_t)~pemPrivacyMask;
+                        dataBuffer->writeBytes(6, &newF, 1);
+                        SYSLOG(DRV_NAME, "PEM-PRIV: LE features byte0 0x%02x -> 0x%02x", oldF, newF);
+                    }
+                }
                 if (getKernelVersion() >= KernelVersion::Sequoia) dataBuffer->complete(kIODirectionInOut);
             }
             IOFree(buffer, allocLen);
@@ -326,7 +358,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if (remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
+    if ((remoteReadSCount > 0 || pemPrivacyMask) && that == _hookPipeInstance && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->owner = completion->owner;
