@@ -94,6 +94,7 @@ static int leFeatRewrite = 0;
 // Disable with boot-arg -ibtrpaoff.
 // ---------------------------------------------------------------------------------------------
 static bool     pemRpaEnabled = true;
+static int      pemOwnType = 0;         // own address type for rewritten connections (0 = public, -1 = keep bluetoothd value); boot-arg ibtrpaown
 static uint8_t  pemAclAddr[6];          // HCI byte order (LSB first)
 static uint8_t  pemAclType = 0;
 static int pemAclCount = 0;
@@ -223,11 +224,14 @@ static bool pemHandleCommand(uint8_t *buf, uint32_t len)
                 p[4] = 0x00;                 // no filter accept list
                 p[5] = 0x01;                 // peer address type: random
                 memcpy(p + 6, pemRpa, 6);    // peer address: current RPA
+                // own address: the controller random address is a fixed fake one set by this patcher,
+                // which the peer cannot resolve -> use the public (identity) address by default
+                if (pemOwnType >= 0) p[12] = (uint8_t)pemOwnType;
                 pemPending = true;
                 pemCntRewrite++;
                 char a[20], b[20];
                 pemFmtMac(a, sizeof(a), pemPendId); pemFmtMac(b, sizeof(b), pemPendRpa);
-                snprintf(pemLast, sizeof(pemLast), "conn %s via %s", a, b);
+                snprintf(pemLast, sizeof(pemLast), "conn %s via %s own=%d", a, b, (int)p[12]);
                 return true;
             }
             break;
@@ -249,6 +253,9 @@ bool CIntelBTPatcher::init()
         char offArg[8];
         if (PE_parse_boot_argn("-ibtrpaoff", offArg, sizeof(offArg)))
             pemRpaEnabled = false;
+        int own = 0;
+        if (PE_parse_boot_argn("ibtrpaown", &own, sizeof(own)))
+            pemOwnType = (own == 0 || own == 1) ? own : -1;
         sysctl_register_oid(&sysctl__debug_ibtp_rpa);
         sysctl_register_oid(&sysctl__debug_ibtp_stat);
     }
