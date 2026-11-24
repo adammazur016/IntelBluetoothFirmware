@@ -10,9 +10,10 @@
 #include <Headers/plugin_start.hpp>
 
 #include <pexpert/pexpert.h>
+extern "C" {
 #include <sys/sysctl.h>
+}
 #include <kern/clock.h>
-#include <libkern/OSAtomic.h>
 #include "IntelBTPatcher.hpp"
 
 static CIntelBTPatcher ibtPatcher;
@@ -79,7 +80,7 @@ bool CIntelBTPatcher::_randomAddressInit = false;
 // identity address -> connections to RPA-only peers (iPhone, Watch) always time out.
 // Boot-arg ibtpriv=<mask> clears these bits in LE features byte 0 (64 = LL Privacy, 128 = Ext Scanner Filter Policies).
 static uint8_t pemPrivacyMask = 0;
-static volatile int leFeatRewrite = 0;
+static int leFeatRewrite = 0;
 
 // ---------------------------------------------------------------------------------------------
 // PEM-RPA: connect to RPA-only peers (iPhone / Watch) without controller address resolution.
@@ -95,16 +96,16 @@ static volatile int leFeatRewrite = 0;
 static bool     pemRpaEnabled = true;
 static uint8_t  pemAclAddr[6];          // HCI byte order (LSB first)
 static uint8_t  pemAclType = 0;
-static volatile int pemAclCount = 0;
+static int pemAclCount = 0;
 static uint8_t  pemRpa[6];              // HCI byte order
-static volatile uint64_t pemRpaTime = 0;   // seconds (uptime), 0 = none
+static uint64_t pemRpaTime = 0;   // seconds (uptime), 0 = none
 static uint8_t  pemRpaBound[6];
-static volatile bool pemRpaIsBound = false;
+static bool pemRpaIsBound = false;
 static uint8_t  pemPendRpa[6];
 static uint8_t  pemPendId[6];
 static uint8_t  pemPendIdType = 0;
-static volatile bool pemPending = false;
-static volatile uint32_t pemCntHint = 0, pemCntRewrite = 0, pemCntFixed = 0, pemCntConnFail = 0;
+static bool pemPending = false;
+static uint32_t pemCntHint = 0, pemCntRewrite = 0, pemCntFixed = 0, pemCntConnFail = 0;
 static char     pemLast[96] = "none";
 static char     pemRpaStr[24] = "";
 
@@ -142,6 +143,7 @@ static void pemFmtMac(char *dst, size_t len, const uint8_t a[6])
 
 static int pemSysctlRpa SYSCTL_HANDLER_ARGS
 {
+    (void)arg1; (void)arg2;
     char buf[24];
     strlcpy(buf, pemRpaStr, sizeof(buf));
     int err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
@@ -158,7 +160,7 @@ static int pemSysctlRpa SYSCTL_HANDLER_ARGS
         pemRpaIsBound = false;
     }
     strlcpy(pemRpaStr, buf, sizeof(pemRpaStr));
-    OSMemoryBarrier();
+    __sync_synchronize();
     pemRpaTime = pemNowSec();
     pemCntHint++;
     return 0;
@@ -166,12 +168,13 @@ static int pemSysctlRpa SYSCTL_HANDLER_ARGS
 
 static int pemSysctlStat SYSCTL_HANDLER_ARGS
 {
+    (void)arg1; (void)arg2;
     char buf[256], id[20] = "-";
     if (pemRpaIsBound) pemFmtMac(id, sizeof(id), pemRpaBound);
     uint64_t age = pemRpaTime ? pemNowSec() - pemRpaTime : 0;
     snprintf(buf, sizeof(buf), "enabled=%d hints=%u rewrites=%u fixed=%u connfail=%u acl=%d rpa=%s bound=%s age=%llus last=%s",
-             pemRpaEnabled, pemCntHint, pemCntRewrite, pemCntFixed, pemCntConnFail, pemAclCount,
-             pemRpaStr[0] ? pemRpaStr : "-", id, age, pemLast);
+             (int)pemRpaEnabled, pemCntHint, pemCntRewrite, pemCntFixed, pemCntConnFail, pemAclCount,
+             pemRpaStr[0] ? pemRpaStr : "-", id, (unsigned long long)age, pemLast);
     return sysctl_handle_string(oidp, buf, strlen(buf) + 1, req);
 }
 
@@ -243,7 +246,8 @@ bool CIntelBTPatcher::init()
         if (PE_parse_boot_argn("ibtpriv", &m, sizeof(m)))
             pemPrivacyMask = (uint8_t)(m & 0xFF);
         SYSLOG(DRV_NAME, "PEM-PRIV: LE feature mask=0x%02x (boot-arg ibtpriv)", pemPrivacyMask);
-        if (checkKernelArgument("-ibtrpaoff"))
+        char offArg[8];
+        if (PE_parse_boot_argn("-ibtrpaoff", offArg, sizeof(offArg)))
             pemRpaEnabled = false;
         sysctl_register_oid(&sysctl__debug_ibtp_rpa);
         sysctl_register_oid(&sysctl__debug_ibtp_stat);
