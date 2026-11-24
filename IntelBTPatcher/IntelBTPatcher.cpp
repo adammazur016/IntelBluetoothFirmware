@@ -87,28 +87,39 @@ static int leFeatRewrite = 0;
 // bluetoothd (THIRD_PARTY_DONGLE path) adds the peer *identity* address to the filter accept list
 // and issues LE Create Connection with initiator filter policy 1, expecting the controller to
 // resolve the peer RPA. The Intel controller never gets the IRKs, so it never matches.
-// bluetoothd logs the current peer RPA ("connectingAddress=Random:XX:..") - a small root helper
-// (log stream) writes it to sysctl debug.ibtp_rpa. When the next LE Create Connection targets the
-// identity in the accept list, we rewrite it into a direct connection to that RPA, and rewrite the
-// resulting LE Connection Complete back to the identity address bluetoothd expects.
-// Disable with boot-arg -ibtrpaoff.
+// bluetoothd resolves the peer adverts in software and logs them ("BLE Scanner Device Found ...
+// BDA <identity> ... AMfD <manufacturer data>"). A small root helper (log stream) writes
+// "<identity>|<mfr hex>" to sysctl debug.ibtp_peer. This kext remembers recent connectable adverts
+// (address + manufacturer data) from the HCI event stream, so it can find the RPA currently used
+// by that identity. The next LE Create Connection targeting the identity is rewritten into a direct
+// connection to that RPA, and the LE Connection Complete is rewritten back to the identity.
+// Disable with boot-arg -ibtrpaoff. Status: sysctl debug.ibtp_stat.
 // ---------------------------------------------------------------------------------------------
 static bool     pemRpaEnabled = true;
-static int      pemOwnType = 0;         // own address type for rewritten connections (0 = public, -1 = keep bluetoothd value); boot-arg ibtrpaown
+static int      pemOwnType = 0;         // own address type for rewritten connections (0 = public, 1 = random, -1 = keep); boot-arg ibtrpaown
 static uint8_t  pemAclAddr[6];          // HCI byte order (LSB first)
 static uint8_t  pemAclType = 0;
-static int pemAclCount = 0;
-static uint8_t  pemRpa[6];              // HCI byte order
-static uint64_t pemRpaTime = 0;   // seconds (uptime), 0 = none
-static uint8_t  pemRpaBound[6];
-static bool pemRpaIsBound = false;
+static int      pemAclCount = 0;
+// peer hints from helper (several own devices: iPhone, Watch, ...)
+struct PemPeer { uint8_t id[6]; uint8_t mfr[32]; uint8_t len; uint64_t t; };
+#define PEM_PEERS 6
+static PemPeer  pemPeers[PEM_PEERS];
+static uint8_t  pemPeerId[6];           // last hinted identity (status only)
+static uint64_t pemPeerTime = 0;        // last hint time (status only)
+// own RPA hint (bluetoothd "connectingAddress") - informational only
+static char     pemOwnRpaStr[24] = "";
+// recent connectable adverts
+struct PemAdv { uint8_t addr[6]; uint8_t mfr[32]; uint8_t len; uint64_t t; };
+#define PEM_ADV_RING 64
+static PemAdv   pemAdv[PEM_ADV_RING];
+static int      pemAdvNext = 0;
+// pending rewritten connection
 static uint8_t  pemPendRpa[6];
 static uint8_t  pemPendId[6];
 static uint8_t  pemPendIdType = 0;
-static bool pemPending = false;
-static uint32_t pemCntHint = 0, pemCntRewrite = 0, pemCntFixed = 0, pemCntConnFail = 0;
-static char     pemLast[96] = "none";
-static char     pemRpaStr[24] = "";
+static bool     pemPending = false;
+static uint32_t pemCntPeer = 0, pemCntAdv = 0, pemCntRewrite = 0, pemCntFixed = 0, pemCntConnFail = 0, pemCntNoMatch = 0;
+static char     pemLast[112] = "none";
 
 static uint64_t pemNowSec()
 {
@@ -142,45 +153,113 @@ static void pemFmtMac(char *dst, size_t len, const uint8_t a[6])
     snprintf(dst, len, "%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
 }
 
+// "14:F2:87:34:D8:C8|4c0010077f1f1f57505818"
+static int pemSysctlPeer SYSCTL_HANDLER_ARGS
+{
+    (void)arg1; (void)arg2;
+    char buf[128] = "";
+    int err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+    if (err || !req->newptr)
+        return err;
+    uint8_t id[6], mfr[32];
+    if (strlen(buf) < 19 || buf[17] != '|' || !pemParseMac(buf, id))
+        return EINVAL;
+    const char *h = buf + 18;
+    int n = 0;
+    while (h[0] && h[1] && n < (int)sizeof(mfr)) {
+        int a = pemHex(h[0]), b = pemHex(h[1]);
+        if (a < 0 || b < 0) break;
+        mfr[n++] = (uint8_t)((a << 4) | b);
+        h += 2;
+    }
+    if (n < 3)
+        return EINVAL;
+    uint64_t now = pemNowSec();
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < PEM_PEERS; i++) {
+        if (pemPeers[i].t && memcmp(pemPeers[i].id, id, 6) == 0) { slot = i; break; }
+        if (pemPeers[i].t < pemPeers[oldest].t) oldest = i;
+    }
+    if (slot < 0) slot = oldest;
+    memcpy(pemPeers[slot].id, id, 6);
+    memcpy(pemPeers[slot].mfr, mfr, n);
+    pemPeers[slot].len = (uint8_t)n;
+    __sync_synchronize();
+    pemPeers[slot].t = now;
+    memcpy(pemPeerId, id, 6);
+    pemPeerTime = now;
+    pemCntPeer++;
+    return 0;
+}
+
 static int pemSysctlRpa SYSCTL_HANDLER_ARGS
 {
     (void)arg1; (void)arg2;
     char buf[24];
-    strlcpy(buf, pemRpaStr, sizeof(buf));
+    strlcpy(buf, pemOwnRpaStr, sizeof(buf));
     int err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
     if (err || !req->newptr)
         return err;
-    uint8_t a[6];
-    if (!pemParseMac(buf, a))
-        return EINVAL;
-    memcpy(pemRpa, a, 6);
-    if (pemAclCount == 1) {
-        memcpy(pemRpaBound, pemAclAddr, 6);
-        pemRpaIsBound = true;
-    } else {
-        pemRpaIsBound = false;
-    }
-    strlcpy(pemRpaStr, buf, sizeof(pemRpaStr));
-    __sync_synchronize();
-    pemRpaTime = pemNowSec();
-    pemCntHint++;
+    strlcpy(pemOwnRpaStr, buf, sizeof(pemOwnRpaStr));
     return 0;
 }
 
 static int pemSysctlStat SYSCTL_HANDLER_ARGS
 {
     (void)arg1; (void)arg2;
-    char buf[256], id[20] = "-";
-    if (pemRpaIsBound) pemFmtMac(id, sizeof(id), pemRpaBound);
-    uint64_t age = pemRpaTime ? pemNowSec() - pemRpaTime : 0;
-    snprintf(buf, sizeof(buf), "enabled=%d hints=%u rewrites=%u fixed=%u connfail=%u acl=%d rpa=%s bound=%s age=%llus last=%s",
-             (int)pemRpaEnabled, pemCntHint, pemCntRewrite, pemCntFixed, pemCntConnFail, pemAclCount,
-             pemRpaStr[0] ? pemRpaStr : "-", id, (unsigned long long)age, pemLast);
+    char buf[320], id[20] = "-";
+    if (pemPeerTime) pemFmtMac(id, sizeof(id), pemPeerId);
+    uint64_t age = pemPeerTime ? pemNowSec() - pemPeerTime : 0;
+    snprintf(buf, sizeof(buf), "enabled=%d own=%d peerhints=%u advs=%u rewrites=%u fixed=%u connfail=%u nomatch=%u acl=%d peer=%s age=%llus ownrpa=%s last=%s",
+             (int)pemRpaEnabled, pemOwnType, pemCntPeer, pemCntAdv, pemCntRewrite, pemCntFixed, pemCntConnFail, pemCntNoMatch,
+             pemAclCount, id, (unsigned long long)age, pemOwnRpaStr[0] ? pemOwnRpaStr : "-", pemLast);
     return sysctl_handle_string(oidp, buf, strlen(buf) + 1, req);
 }
 
-SYSCTL_PROC(_debug, OID_AUTO, ibtp_rpa, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, pemSysctlRpa, "A", "PEM: current peer RPA hint");
+SYSCTL_PROC(_debug, OID_AUTO, ibtp_peer, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, pemSysctlPeer, "A", "PEM: peer identity|manufacturer data hint");
+SYSCTL_PROC(_debug, OID_AUTO, ibtp_rpa, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, pemSysctlRpa, "A", "PEM: bluetoothd connectingAddress (info)");
 SYSCTL_PROC(_debug, OID_AUTO, ibtp_stat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, pemSysctlStat, "A", "PEM: RPA rewrite status");
+
+// Remember connectable random-address adverts (LE Advertising Report, legacy).
+// buf: [0]=0x3E [1]=len [2]=0x02 [3]=num reports, then per report: type addrType addr[6] dlen data[dlen] rssi
+static void pemRecordAdverts(const uint8_t *buf, uint32_t len)
+{
+    if (len < 4) return;
+    uint32_t o = 4;
+    uint64_t now = pemNowSec();
+    // (multi-report events use a field-grouped layout; controllers send 1 report per event in practice)
+    if (buf[3] != 1) return;
+    for (int r = 0; r < 1 && o + 9 <= len; r++) {
+        uint8_t et = buf[o], at = buf[o + 1];
+        const uint8_t *addr = buf + o + 2;
+        uint8_t dl = buf[o + 8];
+        const uint8_t *data = buf + o + 9;
+        if (o + 9 + dl + 1 > len) break;
+        if (et == 0x00 && at == 0x01) {          // ADV_IND from a random address
+            // find manufacturer specific data (AD type 0xFF)
+            uint32_t k = 0;
+            while (k + 1 < dl) {
+                uint8_t l = data[k];
+                if (l == 0 || k + 1 + l > dl) break;
+                if (data[k + 1] == 0xFF && l >= 3) {
+                    uint8_t ml = (uint8_t)min((uint32_t)(l - 1), (uint32_t)32);
+                    int slot = -1;
+                    for (int i = 0; i < PEM_ADV_RING; i++)
+                        if (pemAdv[i].t && memcmp(pemAdv[i].addr, addr, 6) == 0) { slot = i; break; }
+                    if (slot < 0) { slot = pemAdvNext; pemAdvNext = (pemAdvNext + 1) % PEM_ADV_RING; }
+                    memcpy(pemAdv[slot].addr, addr, 6);
+                    memcpy(pemAdv[slot].mfr, data + k + 2, ml);
+                    pemAdv[slot].len = ml;
+                    pemAdv[slot].t = now;
+                    pemCntAdv++;
+                    break;
+                }
+                k += 1 + l;
+            }
+        }
+        o += 9 + dl + 1;
+    }
+}
 
 #define HCI_OP_LE_CREATE_CONN            0x200D
 #define HCI_OP_LE_CLEAR_ACCEPT_LIST      0x2010
@@ -203,38 +282,52 @@ static bool pemHandleCommand(uint8_t *buf, uint32_t len)
                 pemAclType = p[0];
                 memcpy(pemAclAddr, p + 1, 6);
                 pemAclCount++;
-                // hint arrived before the accept list entry: bind it now if fresh
-                if (!pemRpaIsBound && pemRpaTime && pemNowSec() - pemRpaTime <= 3) {
-                    memcpy(pemRpaBound, pemAclAddr, 6);
-                    pemRpaIsBound = true;
-                }
             }
             break;
         case HCI_OP_LE_DEL_ACCEPT_LIST:
             if (pemAclCount > 0) pemAclCount--;
             break;
-        case HCI_OP_LE_CREATE_CONN:
+        case HCI_OP_LE_CREATE_CONN: {
             // params: scanInt(2) scanWin(2) filterPolicy(1) peerType(1) peerAddr(6) ownType(1) ...
-            if (len >= 3 + 25 && p[4] == 0x01 && pemAclCount == 1 && pemRpaIsBound &&
-                memcmp(pemRpaBound, pemAclAddr, 6) == 0 && pemRpaTime &&
-                pemNowSec() - pemRpaTime <= 15) {
-                memcpy(pemPendRpa, pemRpa, 6);
-                memcpy(pemPendId, pemAclAddr, 6);
-                pemPendIdType = pemAclType;
-                p[4] = 0x00;                 // no filter accept list
-                p[5] = 0x01;                 // peer address type: random
-                memcpy(p + 6, pemRpa, 6);    // peer address: current RPA
-                // own address: the controller random address is a fixed fake one set by this patcher,
-                // which the peer cannot resolve -> use the public (identity) address by default
-                if (pemOwnType >= 0) p[12] = (uint8_t)pemOwnType;
-                pemPending = true;
-                pemCntRewrite++;
-                char a[20], b[20];
-                pemFmtMac(a, sizeof(a), pemPendId); pemFmtMac(b, sizeof(b), pemPendRpa);
-                snprintf(pemLast, sizeof(pemLast), "conn %s via %s own=%d", a, b, (int)p[12]);
-                return true;
+            if (len < 3 + 25 || p[4] != 0x01 || pemAclCount != 1)
+                break;
+            char a[20];
+            pemFmtMac(a, sizeof(a), pemAclAddr);
+            uint64_t now = pemNowSec();
+            int pi = -1;
+            for (int i = 0; i < PEM_PEERS; i++)
+                if (pemPeers[i].t && now - pemPeers[i].t <= 300 && memcmp(pemPeers[i].id, pemAclAddr, 6) == 0) { pi = i; break; }
+            if (pi < 0) {
+                pemCntNoMatch++;
+                snprintf(pemLast, sizeof(pemLast), "conn %s: no peer hint", a);
+                break;
             }
-            break;
+            int best = -1;
+            for (int i = 0; i < PEM_ADV_RING; i++) {
+                if (!pemAdv[i].t || now - pemAdv[i].t > 300) continue;
+                if (pemAdv[i].len != pemPeers[pi].len || memcmp(pemAdv[i].mfr, pemPeers[pi].mfr, pemPeers[pi].len) != 0) continue;
+                if (best < 0 || pemAdv[i].t > pemAdv[best].t) best = i;
+            }
+            if (best < 0) {
+                pemCntNoMatch++;
+                snprintf(pemLast, sizeof(pemLast), "conn %s: no advert matches hint", a);
+                break;
+            }
+            memcpy(pemPendRpa, pemAdv[best].addr, 6);
+            memcpy(pemPendId, pemAclAddr, 6);
+            pemPendIdType = pemAclType;
+            p[4] = 0x00;                       // no filter accept list
+            p[5] = 0x01;                       // peer address type: random
+            memcpy(p + 6, pemPendRpa, 6);      // peer address: RPA currently advertised by the peer
+            if (pemOwnType >= 0) p[12] = (uint8_t)pemOwnType;
+            pemPending = true;
+            pemCntRewrite++;
+            char b[20];
+            pemFmtMac(b, sizeof(b), pemPendRpa);
+            snprintf(pemLast, sizeof(pemLast), "conn %s via %s (adv %llus old) own=%d", a, b,
+                     (unsigned long long)(now - pemAdv[best].t), (int)p[12]);
+            return true;
+        }
         default:
             break;
     }
@@ -256,6 +349,7 @@ bool CIntelBTPatcher::init()
         int own = 0;
         if (PE_parse_boot_argn("ibtrpaown", &own, sizeof(own)))
             pemOwnType = (own == 0 || own == 1) ? own : -1;
+        sysctl_register_oid(&sysctl__debug_ibtp_peer);
         sysctl_register_oid(&sysctl__debug_ibtp_rpa);
         sysctl_register_oid(&sysctl__debug_ibtp_stat);
     }
@@ -495,6 +589,8 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
             if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
                 dataBuffer->readBytes(0, buffer, allocLen);
                 HciEventHdr *hdr = (HciEventHdr *)buffer;
+                if (pemRpaEnabled && hdr->evt == HCI_EVT_LE_META && allocLen >= 4 && hdr->data[0] == 0x02)
+                    pemRecordAdverts((const uint8_t *)buffer, allocLen);
                 if (remoteReadSCount > 0 && hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
                     if (leMetaStage == 0) {
                         leMetaStage = 1;            // real features complete -> pass through
@@ -556,7 +652,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if ((remoteReadSCount > 0 || pemPrivacyMask || pemPending) && that == _hookPipeInstance && completion) {
+    if ((remoteReadSCount > 0 || pemPrivacyMask || pemRpaEnabled) && that == _hookPipeInstance && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->owner = completion->owner;
